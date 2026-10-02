@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 
 use anyhow::Result;
 
 use crate::config::ModelConfig;
-use crate::ContentType;
+use crate::{ContentType, FileType, Options};
 
 /// Features to identify a file using AI.
 pub struct Features(pub(crate) Vec<i32>);
@@ -74,37 +75,65 @@ pub enum FeaturesOrRuled {
     /// Features extracted for identification using AI.
     Features(Features),
 
-    /// Content identified with rules.
-    Ruled(ContentType),
+    /// File identified without AI.
+    Ruled(FileType),
 }
 
 impl FeaturesOrRuled {
-    /// Extracts the features from a file.
+    /// Extracts the features from a file path.
     ///
-    /// Returns the content type directly if the file cannot be identified using AI.
-    pub fn extract(mut file: impl Input, rules: bool) -> Result<Self> {
+    /// Returns the file type directly if the file cannot be identified using AI.
+    pub fn extract_file(file: impl AsRef<Path>, options: &Options) -> Result<Self> {
+        let file = file.as_ref();
+        let metadata = if options.follow_symlink {
+            std::fs::metadata(file)?
+        } else {
+            std::fs::symlink_metadata(file)?
+        };
+        if metadata.is_dir() {
+            Ok(FeaturesOrRuled::Ruled(FileType::Directory))
+        } else if metadata.is_symlink() {
+            Ok(FeaturesOrRuled::Ruled(FileType::Symlink))
+        } else if !metadata.is_file() {
+            Ok(FeaturesOrRuled::Ruled(FileType::Unsupported))
+        } else {
+            Self::extract_content(std::fs::File::open(file)?, options)
+        }
+    }
+
+    /// Extracts the features from file content.
+    ///
+    /// Returns the file type directly if the content cannot be identified using AI.
+    pub fn extract_content(mut file: impl Input, options: &Options) -> Result<Self> {
         let config = &crate::model::CONFIG;
         let file_len = file.length()?;
         if file_len == 0 {
-            return Ok(FeaturesOrRuled::Ruled(ContentType::Empty));
+            return Ok(FeaturesOrRuled::Ruled(FileType::Ruled(ContentType::Empty)));
         }
         let first_block = read_first_block(config, &mut file, file_len)?;
-        if rules {
-            #[cfg(feature = "rules")]
+        if options.use_rules {
             if let Some(content_type) = crate::rules::Rules::identify(&first_block, file_len) {
-                return Ok(FeaturesOrRuled::Ruled(content_type));
+                return Ok(FeaturesOrRuled::Ruled(FileType::Ruled(content_type)));
             }
         }
-        let features = extract_features(config, file, file_len, &first_block)?;
-        if features[config.min_file_size_for_dl - 1] != config.padding_token {
-            return Ok(FeaturesOrRuled::Features(Features(features)));
+        if options.use_model {
+            let features = extract_features(config, file, file_len, &first_block)?;
+            if features[config.min_file_size_for_dl - 1] != config.padding_token {
+                return Ok(FeaturesOrRuled::Features(Features(features)));
+            }
         }
         debug_assert!(first_block.len() <= config.block_size);
         let content_type = match std::str::from_utf8(&first_block) {
-            Ok(_) => ContentType::Txt,
+            // The file is not UTF-8.
+            Err(_) if file_len == first_block.len() as u64 => ContentType::Unknown,
+            // The first block doesn't disprove that the file may be UTF-8.
+            Err(e) if e.error_len().is_none() => ContentType::Txt,
+            // The first block disproves that the file is UTF-8.
             Err(_) => ContentType::Unknown,
+            // The file is UTF-8 or its first block doesn't disprove that it can't be.
+            Ok(_) => ContentType::Txt,
         };
-        Ok(FeaturesOrRuled::Ruled(content_type))
+        Ok(FeaturesOrRuled::Ruled(FileType::Ruled(content_type)))
     }
 }
 

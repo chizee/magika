@@ -46,6 +46,8 @@ pub enum MagikaFileTypeKind {
     Inferred = 2,
     /// The file is a regular file and was identified using rules.
     Ruled = 3,
+    /// The file is neither a directory, a symbolic link, nor a regular file.
+    Unsupported = 4,
 }
 
 /// Reason why an inferred content type was overwritten.
@@ -91,7 +93,7 @@ pub struct MagikaResult {
     pub kind: MagikaFileTypeKind,
     /// Resolved content type information (never null, points to static storage).
     pub info: *const MagikaTypeInfo,
-    /// Confidence score between 0.0 and 1.0 (1.0 for directory, symlink, or ruled).
+    /// Confidence score between 0.0 and 1.0 (1.0 for directory, symlink, ruled, or unsupported).
     pub score: f32,
     /// Raw model output before overwrite rules were applied (null if not inferred).
     pub inferred_info: *const MagikaTypeInfo,
@@ -115,6 +117,65 @@ pub enum MagikaBackend {
     Gpu = 2,
 }
 
+/// Minimum confidence level for inference.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+#[repr(C)]
+pub enum MagikaPredictionMode {
+    /// The model output is only used when highly confident.
+    #[default]
+    HighConfidence = 0,
+    /// The model output is used when reasonably confident.
+    MediumConfidence = 1,
+    /// The model output is always used.
+    BestGuess = 2,
+}
+
+impl From<MagikaPredictionMode> for magika::PredictionMode {
+    fn from(mode: MagikaPredictionMode) -> Self {
+        match mode {
+            MagikaPredictionMode::HighConfidence => magika::PredictionMode::HighConfidence,
+            MagikaPredictionMode::MediumConfidence => magika::PredictionMode::MediumConfidence,
+            MagikaPredictionMode::BestGuess => magika::PredictionMode::BestGuess,
+        }
+    }
+}
+
+/// Configuration options for identification.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct MagikaOptions {
+    /// Identifies using rules (before inference).
+    pub use_rules: bool,
+    /// Identifies using inference (after rules).
+    pub use_model: bool,
+    /// Configures the minimum confidence level for inference.
+    pub prediction_mode: MagikaPredictionMode,
+    /// Whether to follow symlinks.
+    pub follow_symlink: bool,
+}
+
+impl Default for MagikaOptions {
+    fn default() -> Self {
+        Self {
+            use_rules: true,
+            use_model: true,
+            prediction_mode: MagikaPredictionMode::HighConfidence,
+            follow_symlink: true,
+        }
+    }
+}
+
+impl From<MagikaOptions> for magika::Options {
+    fn from(options: MagikaOptions) -> Self {
+        let mut result = Self::default();
+        result.use_rules = options.use_rules;
+        result.use_model = options.use_model;
+        result.prediction_mode = options.prediction_mode.into();
+        result.follow_symlink = options.follow_symlink;
+        result
+    }
+}
+
 /// Options for configuring a Magika runtime.
 #[derive(Debug, Copy, Clone, Default)]
 #[repr(C)]
@@ -123,8 +184,8 @@ pub struct MagikaRuntimeOptions {
     pub backend: MagikaBackend,
     /// The maximum batch size to optimize for (0 for runtime default).
     pub max_batch: usize,
-    /// Whether to identify files with format rules before inference.
-    pub rules: bool,
+    /// Configuration options for identification.
+    pub options: MagikaOptions,
 }
 
 /// Shared Magika inference runtime (thread-safe).
@@ -195,7 +256,7 @@ pub unsafe extern "C" fn magika_runtime_new(
                 if opts.max_batch > 0 {
                     builder = builder.with_max_batch(opts.max_batch);
                 }
-                builder = builder.with_rules(opts.rules);
+                builder = builder.with_options(opts.options.into());
             }
             builder.build()
         },
@@ -309,6 +370,13 @@ fn file_type_to_c(file_type: &magika::FileType) -> MagikaResult {
                 overwrite_reason,
             }
         }
+        magika::FileType::Unsupported => MagikaResult {
+            kind: MagikaFileTypeKind::Unsupported,
+            info: &content::UNSUPPORTED,
+            score: 1.0,
+            inferred_info: std::ptr::null(),
+            overwrite_reason: MagikaOverwriteReason::None,
+        },
     }
 }
 
@@ -379,15 +447,17 @@ unsafe fn extract_features(
         magika::FeaturesOrRuled::Features(features) => {
             *out_features = Box::into_raw(Box::new(MagikaFeatures { inner: features }));
         }
-        magika::FeaturesOrRuled::Ruled(content_type) => {
+        magika::FeaturesOrRuled::Ruled(file_type) => {
             if !out_result.is_null() {
-                *out_result = file_type_to_c(&magika::FileType::Ruled(content_type));
+                *out_result = file_type_to_c(&file_type);
             }
         }
     })
 }
 
 /// Extracts features from a file on disk for neural network inference.
+///
+/// If `options` is NULL, the default configuration is used.
 ///
 /// If the file does not require neural network inference (for example, if it is empty
 /// or identified by rules):
@@ -402,11 +472,12 @@ unsafe fn extract_features(
 /// # Safety
 ///
 /// - `path` must point to a null-terminated C string.
+/// - `options` may be NULL, or must point to a valid `MagikaOptions` struct.
 /// - `out_features` must point to a valid, writable pointer to `MagikaFeatures`.
 /// - `out_result` may be NULL, or must point to a valid, writable `MagikaResult` struct.
 #[no_mangle]
 pub unsafe extern "C" fn magika_features_extract_file(
-    path: *const c_char, rules: bool, out_features: *mut *mut MagikaFeatures,
+    path: *const c_char, options: *const MagikaOptions, out_features: *mut *mut MagikaFeatures,
     out_result: *mut MagikaResult,
 ) -> MagikaStatus {
     if out_features.is_null() {
@@ -414,13 +485,15 @@ pub unsafe extern "C" fn magika_features_extract_file(
     }
     *out_features = std::ptr::null_mut();
     let Some(path_ref) = parse_path(path) else { return MagikaStatus::InvalidArgument };
+    let options = if options.is_null() { magika::Options::default() } else { (*options).into() };
     extract_features(out_features, out_result, || {
-        let file = std::fs::File::open(path_ref)?;
-        magika::FeaturesOrRuled::extract(file, rules)
+        magika::FeaturesOrRuled::extract_file(path_ref, &options)
     })
 }
 
 /// Extracts features from an in-memory buffer for neural network inference.
+///
+/// If `options` is NULL, the default configuration is used.
 ///
 /// If the buffer does not require neural network inference (for example, if it is empty
 /// or identified by rules):
@@ -435,19 +508,23 @@ pub unsafe extern "C" fn magika_features_extract_file(
 /// # Safety
 ///
 /// - `data` must point to at least `len` readable bytes (may be NULL only if `len == 0`).
+/// - `options` may be NULL, or must point to a valid `MagikaOptions` struct.
 /// - `out_features` must point to a valid, writable pointer to `MagikaFeatures`.
 /// - `out_result` may be NULL, or must point to a valid, writable `MagikaResult` struct.
 #[no_mangle]
 pub unsafe extern "C" fn magika_features_extract_content(
-    data: *const u8, len: usize, rules: bool, out_features: *mut *mut MagikaFeatures,
-    out_result: *mut MagikaResult,
+    data: *const u8, len: usize, options: *const MagikaOptions,
+    out_features: *mut *mut MagikaFeatures, out_result: *mut MagikaResult,
 ) -> MagikaStatus {
     if out_features.is_null() || (data.is_null() && len > 0) {
         return MagikaStatus::InvalidArgument;
     }
     *out_features = std::ptr::null_mut();
     let bytes = if len == 0 { &[][..] } else { std::slice::from_raw_parts(data, len) };
-    extract_features(out_features, out_result, || magika::FeaturesOrRuled::extract(bytes, rules))
+    let options = if options.is_null() { magika::Options::default() } else { (*options).into() };
+    extract_features(out_features, out_result, || {
+        magika::FeaturesOrRuled::extract_content(bytes, &options)
+    })
 }
 
 /// Identifies the content type of a file from its extracted features.
